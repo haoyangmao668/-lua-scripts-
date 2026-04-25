@@ -1,0 +1,95 @@
+/**
+ * 百度直连 (Loon Custom)
+ * 行为已对齐稳定使用的 Lua 版本
+ * - 签名仅基于 host (不含端口)
+ * - 握手不校验状态码，收到完整响应即建立隧道
+ * - 后续数据透明转发，无任何干扰
+ * 
+ * 使用方式：
+ * [Proxy]
+ * customBaidu = custom, cloudnproxy.baidu.com, 443, script-path=脚本URL
+ * 
+ * author: 星璃 (原版)
+ * update: 对齐 Lua 稳定版行为
+ */
+
+// --- 状态定义 ---
+let HTTP_STATUS_INIT = -1;
+let HTTP_STATUS_HEADER_SENT = 0;
+let HTTP_STATUS_WAIT_RESPONSE = 1;
+let HTTP_STATUS_FORWARDING = 2;
+var httpStatus = HTTP_STATUS_INIT;
+
+// --- 动态签名（仅基于 host，与 Lua 版一致）---
+function createVerify(host) {
+  let index = 0;
+  const factor = 1318293;
+  for (let i = 0; i < host.length; i++) {
+    index = (index * factor & 0x7FFFFFFF) + host.charCodeAt(i);
+  }
+  if (index < 0) {
+    index = index & 0x7FFFFFFF;
+  }
+  return index;
+}
+
+// --- 构建 CONNECT 头 ---
+function _buildHttpHeader() {
+  const conHost = $session.conHost;
+  const conPort = $session.conPort;
+  const verify = createVerify(conHost);
+  return "CONNECT " + conHost + ":" + conPort + " HTTP/1.1\r\n" +
+         "Host: " + conHost + ":" + conPort + "\r\n" +
+         "X-T5-Auth: " + verify + "\r\n" +
+         "Proxy-Connection: Keep-Alive\r\n\r\n";
+}
+
+// --- 发送 CONNECT 头 ---
+function _sendHttpHeader() {
+  if (httpStatus === HTTP_STATUS_INIT) {
+    const header = _buildHttpHeader();
+    $tunnel.write($session, header);
+    httpStatus = HTTP_STATUS_HEADER_SENT;
+  }
+}
+
+// --- 生命周期回调 ---
+
+function tunnelDidConnected() {
+  if (!$session.proxy.isTLS) {
+    _sendHttpHeader();
+  }
+  return true;
+}
+
+function tunnelTLSFinished() {
+  if ($session.proxy.isTLS) {
+    _sendHttpHeader();
+  }
+  return true;
+}
+
+function tunnelDidRead(data) {
+  if (httpStatus === HTTP_STATUS_WAIT_RESPONSE) {
+    // 不校验状态码，收到完整响应头即建立隧道（与 Lua 版一致）
+    httpStatus = HTTP_STATUS_FORWARDING;
+    $tunnel.established($session);
+    return null;
+  } else if (httpStatus === HTTP_STATUS_FORWARDING) {
+    return data; // 透明转发
+  }
+  return null;
+}
+
+function tunnelDidWrite() {
+  if (httpStatus === HTTP_STATUS_HEADER_SENT) {
+    httpStatus = HTTP_STATUS_WAIT_RESPONSE;
+    $tunnel.readTo($session, "\r\n\r\n");
+    return false;
+  }
+  return true;
+}
+
+function tunnelDidClose() {
+  return true;
+}
