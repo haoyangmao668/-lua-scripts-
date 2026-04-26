@@ -1,0 +1,110 @@
+/*
+ * 转换自双层锁漏流Lua
+ * Loon Custom 百度直连｜443双层注入 极致锁漏流
+ * 动态X-T5-Auth、握手注入+上行HTTP二次补头
+ * 非443直接直通，分流靠策略
+ */
+let HTTP_STATUS_INVALID = -1;
+let HTTP_STATUS_CONNECTED = 0;
+let HTTP_STATUS_WAITRESPONSE = 1;
+let HTTP_STATUS_FORWARDING = 2;
+var httpStatus = HTTP_STATUS_INVALID;
+
+//星璃原版动态Auth算法
+function createVerify(address) {
+  let index = 0;
+  for(let i = 0; i < address.length; i++) {
+    index = (index * 1318293 & 0x7FFFFFFF) + address.charCodeAt(i);
+  }
+  if(index < 0) {
+    index = index & 0x7FFFFFFF;
+  }
+  return `X-T5-Auth: ${index}\r\n`;
+}
+
+//判断443端口
+function isHttpsPort(){
+  return $session.conPort === 443
+}
+
+//HTTP请求头部重写二次注入
+function rewriteHttpRequest(buf,host,auth){
+  let idx = buf.indexOf('/');
+  if(idx === -1) return buf;
+  let method = buf.substring(0,idx);
+  let rest = buf.substring(idx);
+  let rn = rest.indexOf("\r\n");
+  if(rn === -1) return buf;
+  let line = rest.substring(0,rn);
+  let last = rest.substring(rn);
+  return `${method}${line}\r\nHost: ${host}:443\r\n${auth}${last}`;
+}
+
+function tunnelDidConnected() {
+  //非443直接透传
+  if(!isHttpsPort()){
+    $tunnel.established($session);
+    return true;
+  }
+  if ($session.proxy.isTLS) {
+
+  } else {
+    _writeHttpHeader();
+    httpStatus = HTTP_STATUS_CONNECTED;
+  }
+  return true;
+}
+
+function tunnelTLSFinished() {
+  if(!isHttpsPort()){
+    $tunnel.established($session);
+    return true;
+  }
+  _writeHttpHeader();
+  httpStatus = HTTP_STATUS_CONNECTED;
+  return true;
+}
+
+function tunnelDidRead(data) {
+  if(!isHttpsPort()) return data;
+  if (httpStatus === HTTP_STATUS_WAITRESPONSE) {
+    httpStatus = HTTP_STATUS_FORWARDING;
+    $tunnel.established($session);
+    return null;
+  }
+  return data;
+}
+
+function tunnelDidWrite(data) {
+  if(!isHttpsPort()) return data;
+
+  //握手阶段
+  if (httpStatus === HTTP_STATUS_CONNECTED) {
+    httpStatus = HTTP_STATUS_WAITRESPONSE;
+    $tunnel.readTo($session, '\x0D\x0A\x0D\x0A');
+    return false;
+  }
+
+  //转发阶段：二次注入头部（双层锁漏流核心）
+  if(httpStatus === HTTP_STATUS_FORWARDING && data.toString().includes("HTTP/")){
+    let host = $session.conHost;
+    let auth = createVerify(host);
+    return rewriteHttpRequest(data.toString(),host,auth);
+  }
+
+  return data;
+}
+
+function tunnelDidClose() {
+  httpStatus = HTTP_STATUS_INVALID;
+  return true;
+}
+
+//第一层CONNECT握手注入
+function _writeHttpHeader() {
+  let conHost = $session.conHost;
+  let conPort = $session.conPort;
+  let verify = createVerify(conHost);
+  let header = `CONNECT ${conHost}:${conPort} HTTP/1.1\r\nHost: ${conHost}:${conPort}\r\nProxy-Connection: keep-alive\r\n${verify}\r\n`;
+  $tunnel.write($session, header);
+}
