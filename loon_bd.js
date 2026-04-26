@@ -1,8 +1,7 @@
 /*
-纯正官方星璃原版
-无任何端口判断、不关闭、不透传
-分流全部依靠loon规则，永不断网
-双层注入锁漏流
+同源星璃｜和小火箭Lua同算法
+无固定443、无端口判断、纯双层注入
+依靠规则隔离非443，零断网
 */
 let HTTP_STATUS_INVALID = -1;
 let HTTP_STATUS_CONNECTED = 0;
@@ -19,7 +18,7 @@ function createVerify(address) {
   return `X-T5-Auth: ${index}\r\n`;
 }
 
-function rewriteHttpRequest(buf,host,auth){
+function rewriteHttpRequest(buf,host,port,auth){
   let idx = buf.indexOf('/');
   if(idx === -1) return buf;
   let method = buf.substring(0,idx);
@@ -28,11 +27,11 @@ function rewriteHttpRequest(buf,host,auth){
   if(rn === -1) return buf;
   let line = rest.substring(0,rn);
   let last = rest.substring(rn);
-  return `${method}${line}\r\nHost: ${host}:443\r\n${auth}${last}`;
+  return `${method}${line}\r\nHost: ${host}:${port}\r\n${auth}${last}`;
 }
 
 function tunnelDidConnected() {
-  if ($session.proxy.isTLS) {} else {
+  if (!$session.proxy.isTLS) {
     _writeHttpHeader();
     httpStatus = HTTP_STATUS_CONNECTED;
   }
@@ -55,15 +54,16 @@ function tunnelDidRead(data) {
 }
 
 function tunnelDidWrite(data) {
+  let host = $session.conHost;
+  let port = $session.conPort;
   if (httpStatus === HTTP_STATUS_CONNECTED) {
     httpStatus = HTTP_STATUS_WAITRESPONSE;
     $tunnel.readTo($session, '\x0D\x0A\x0D\x0A');
     return false;
   }
   if(httpStatus === HTTP_STATUS_FORWARDING && data.toString().includes("HTTP/")){
-    let host = $session.conHost;
     let auth = createVerify(host);
-    return rewriteHttpRequest(data.toString(),host,auth);
+    return rewriteHttpRequest(data.toString(),host,port,auth);
   }
   return data;
 }
