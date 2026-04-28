@@ -1,7 +1,6 @@
 /**
- * 钉钉套壳百度直连
- * Loon custom JS｜网页游戏双通、UDP全放行
- * 全部流量走代理隧道、无手机直连
+ * 钉钉套壳百度｜修复SSL错误
+ * Loon custom 无SSL报错、UDP全放行、网页游戏双通
  */
 let HTTP_STATUS_INVALID = -1;
 let HTTP_STATUS_CONNECTED = 0;
@@ -57,7 +56,7 @@ function _writeHttpHeader() {
   let host = $session.conHost;
   let port = $session.conPort;
   let auth = createVerify(host);
-  //钉钉443套壳Host，不使用@拼接，规避URL非法报错
-  let header = `CONNECT ${host}:${port} HTTP/1.1\r\nHost: alidocs.dingtalk.com:443\r\nX-T5-Auth: ${auth}\r\nProxy-Connection: keep-alive\r\n\r\n`;
+  //同源证书钉钉域，杜绝SSL错误
+  let header = `CONNECT ${host}:${port} HTTP/1.1\r\nHost: cloudnproxy.dingtalk.com:443\r\nX-T5-Auth: ${auth}\r\nProxy-Connection: keep-alive\r\n\r\n`;
   $tunnel.write($session, header);
 }
