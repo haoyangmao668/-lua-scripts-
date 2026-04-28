@@ -1,100 +1,70 @@
-/**
- * Loon 百度直连 - 性能优化版
- * 适配 Loon custom 协议，带校验缓存、错误处理、无IPv6逻辑
- */
+--A改B｜动态签名缓存+无脑全部放行+游戏兼容
+--去掉200校验、UDP/TCP畸形全部代理内放行、不断连
+local http = require 'http'
+local backend = require 'backend'
 
-let HTTP_STATUS_INVALID = -1;
-let HTTP_STATUS_CONNECTED = 0;
-let HTTP_STATUS_WAITRESPONSE = 1;
-let HTTP_STATUS_FORWARDING = 2;
-let httpStatus = HTTP_STATUS_INVALID;
+local byte = string.byte
+local DIRECT_WRITE = backend.SUPPORT.DIRECT_WRITE
+local SUCCESS,HANDSHAKE,DIRECT = backend.RESULT.SUCCESS,backend.RESULT.HANDSHAKE,backend.RESULT.DIRECT
 
-// 校验缓存，避免重复计算
-const authCache = new Map();
+local ctx_uuid = backend.get_uuid
+local ctx_address_host = backend.get_address_host
+local ctx_address_port = backend.get_address_port
+local ctx_write = backend.write
+local ctx_free = backend.free
 
-// 原版星璃校验算法 + 缓存优化
-function createVerify(address) {
-  if (authCache.has(address)) {
-    return authCache.get(address);
-  }
-  let index = 0;
-  for (let i = 0; i < address.length; i++) {
-    index = ((index * 1318293) & 0x7FFFFFFF) + address.charCodeAt(i);
-  }
-  if (index < 0) {
-    index = index & 0x7FFFFFFF;
-  }
-  authCache.set(address, index);
-  // 缓存上限清理，防止长期运行内存堆积
-  if (authCache.size > 30) {
-    authCache.clear();
-  }
-  return index;
-}
+local kHttpHeaderSent = 1
+local kHttpHeaderRecived = 2
+local flags = {}
+local auth_cache = {}
 
-// 检查响应是否为200 OK，过滤无效握手
-function isSuccessResponse(buf) {
-  const text = typeof buf === 'string' ? buf : String.fromCharCode.apply(null, new Uint8Array(buf));
-  return /^HTTP\/\d\.\d 200 /.test(text);
-}
+--A原版动态算法+缓存
+local function createVerify(address)
+    local verify = auth_cache[address]
+    if verify then return verify end
+    local index = 0
+    for i = 1, #address do
+        index = (index * 1318293 & 0x7FFFFFFF) + byte(address, i)
+    end
+    if index < 0 then index = index & 0x7FFFFFFF end
+    verify = 'X-T5-Auth: ' .. index .. '\r\n'
+    auth_cache[address] = verify
+    if #auth_cache > 25 then auth_cache = {} end
+    return verify
+end
 
-function tunnelDidConnected() {
-  if ($session.proxy.isTLS) {
-    // TLS 连接时，等待 tunnelTLSFinished 回调再发请求头
-  } else {
-    _writeHttpHeader();
-    httpStatus = HTTP_STATUS_CONNECTED;
-  }
-  return true;
-}
+function wa_lua_on_flags_cb(ctx)
+    return DIRECT_WRITE
+end
 
-function tunnelTLSFinished() {
-  _writeHttpHeader();
-  httpStatus = HTTP_STATUS_CONNECTED;
-  return true;
-}
+function wa_lua_on_handshake_cb(ctx)
+    local uuid = ctx_uuid(ctx)
+    if flags[uuid] == kHttpHeaderRecived then return true end
 
-function tunnelDidRead(data) {
-  if (httpStatus === HTTP_STATUS_WAITRESPONSE) {
-    // 校验响应状态
-    if (isSuccessResponse(data)) {
-      httpStatus = HTTP_STATUS_FORWARDING;
-      $tunnel.established($session);
-      return null;
-    } else {
-      // 响应非200，直接关闭会话，避免卡死
-      console.log(`握手失败，响应非200，关闭会话`);
-      $tunnel.close($session);
-      return null;
-    }
-  } else if (httpStatus === HTTP_STATUS_FORWARDING) {
-    return data;
-  }
-  return null;
-}
+    if flags[uuid] ~= kHttpHeaderSent then
+        local host = ctx_address_host(ctx)
+        local port = ctx_address_port(ctx)
+        local request = 'CONNECT '..host..':'..port..' HTTP/1.1\r\n'..
+        'Host:'..host..':'..port..'\r\nProxy-Connection:Keep-Alive\r\n'..createVerify(host)..'\r\n'
+        ctx_write(ctx, request)
+        flags[uuid] = kHttpHeaderSent
+    end
+    return false
+end
 
-function tunnelDidWrite() {
-  if (httpStatus === HTTP_STATUS_CONNECTED) {
-    httpStatus = HTTP_STATUS_WAITRESPONSE;
-    // 读取响应头，直到\r\n\r\n结束
-    $tunnel.readTo($session, '\x0D\x0A\x0D\x0A');
-    return false;
-  }
-  return true;
-}
+--照搬B放行逻辑：无任何校验、全部畸形包代理内放行、不切断游戏UDP
+function wa_lua_on_read_cb(ctx, buf)
+    local uuid = ctx_uuid(ctx)
+    if flags[uuid] == kHttpHeaderSent then
+        flags[uuid] = kHttpHeaderRecived
+        return HANDSHAKE, nil
+    end
+    return DIRECT, buf
+end
 
-function tunnelDidClose() {
-  // 重置状态，避免跨会话污染
-  httpStatus = HTTP_STATUS_INVALID;
-  return true;
-}
-
-// 发送CONNECT请求头
-function _writeHttpHeader() {
-  const conHost = $session.conHost;
-  const conPort = $session.conPort;
-  const verify = createVerify(conHost);
-
-  const header = `CONNECT ${conHost}:${conPort} HTTP/1.1\r\nHost: ${conHost}:${conPort}\r\nX-T5-Auth: ${verify}\r\nProxy-Connection: keep-alive\r\n\r\n`;
-  $tunnel.write($session, header);
-}
+function wa_lua_on_close_cb(ctx)
+    local uuid = ctx_uuid(ctx)
+    flags[uuid] = nil
+    ctx_free(ctx)
+    return SUCCESS
+end
