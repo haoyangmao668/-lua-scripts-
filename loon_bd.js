@@ -1,60 +1,50 @@
-// 福州联通专用｜无日志｜异步非阻塞｜百度直连
-let HTTP_STATUS_INVALID = -1;
-let HTTP_STATUS_CONNECTED = 0;
-let HTTP_STATUS_WAITRESPONSE = 1;
-let HTTP_STATUS_FORWARDING = 2;
-var httpStatus = HTTP_STATUS_INVALID;
+// Loon 百度直连 · 异步无阻塞 · 联通优化版
+const STATUS_CONNECT = 0;
+const STATUS_FORWARD = 1;
+let state = STATUS_CONNECT;
 
-function createVerify(address) {
-  let index = 0;
-  for(let i = 0; i < address.length; i++) {
-    index = (index * 1318293 & 0x7FFFFFFF) + address.charCodeAt(i);
+function createVerify(host) {
+  let r = 0;
+  for (let i = 0; i < host.length; i++) {
+    r = (r * 1318293 & 0x7FFFFFFF) + host.charCodeAt(i);
   }
-  if(index < 0) index = index & 0x7FFFFFFF;
-  return index;
+  return r < 0 ? r & 0x7FFFFFFF : r;
 }
 
 function tunnelDidConnected() {
-  if (!$session.proxy.isTLS) {
-    _writeHttpHeader();
-    httpStatus = HTTP_STATUS_CONNECTED;
-  }
   return true;
 }
 
 function tunnelTLSFinished() {
-  _writeHttpHeader();
-  httpStatus = HTTP_STATUS_CONNECTED;
+  const conHost = $session.conHost;
+  const conPort = $session.conPort;
+  const auth = createVerify(conHost);
+  const req = 
+`CONNECT ${conHost}:${conPort} HTTP/1.1
+Host: ${conHost}:${conPort}
+X-T5-Auth: ${auth}
+Proxy-Connection: keep-alive
+
+`;
+  $tunnel.write($session, req);
+  state = STATUS_FORWARD;
   return true;
 }
 
 function tunnelDidRead(data) {
-  if (httpStatus === HTTP_STATUS_WAITRESPONSE) {
-    httpStatus = HTTP_STATUS_FORWARDING;
-    $tunnel.established($session);
-    return null;
-  } else if (httpStatus === HTTP_STATUS_FORWARDING) {
+  if (state === STATUS_FORWARD) {
     return data;
   }
+  // 不读、不等待响应头，直接透传
+  state = STATUS_FORWARD;
+  $tunnel.established($session);
+  return null;
 }
 
 function tunnelDidWrite() {
-  if (httpStatus === HTTP_STATUS_CONNECTED) {
-    httpStatus = HTTP_STATUS_WAITRESPONSE;
-    $tunnel.readTo($session, '\x0D\x0A\x0D\x0A');
-    return false;
-  }
-  return true;
+  return state === STATUS_FORWARD;
 }
 
 function tunnelDidClose() {
   return true;
-}
-
-function _writeHttpHeader() {
-  let conHost = $session.conHost;
-  let conPort = $session.conPort;
-  let verify = createVerify(conHost);
-  var header = `CONNECT ${conHost}:${conPort} HTTP/1.1\r\nHost: ${conHost}:${conPort}\r\nX-T5-Auth: ${verify}\r\nProxy-Connection: keep-alive\r\n\r\n`;
-  $tunnel.write($session, header);
 }
