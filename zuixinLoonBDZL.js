@@ -1,26 +1,38 @@
 /**
- * Loon Custom协议 | 百度免流直连（UDP优先 + 状态校验）
- * 适配：Loon custom type，使用明文HTTP代理（配置中不要加 tls=true）
- * 使用示例：
+ * Loon Custom协议 百度直连（星璃框架 + 小火箭Lua移植）
+ * 基于星璃原版，完整迁移动态UA/TraceID/Padding/域名识别/UDP优先
+ * 配置示例：
  * [Proxy]
- * BaiduFree = custom, 153.3.236.22, 443, script-path=脚本地址
+ * BaiduFree = custom, 153.3.236.22, 443, script-path=本脚本地址
+ * 注意：不要加 tls=true，使用明文HTTP代理
  * 
  * 特性：
- * - 动态UA、40位随机TraceID、TLS Padding抗指纹
- * - UDP特征域名优先，其次红果/字节系
- * - 校验代理返回的HTTP状态码，非200时自动断开
- * - 基于readTo()可靠握手
+ * - 动态生成40位TraceID
+ * - 随机百度UA池
+ * - TLS Padding抗指纹
+ * - 自动识别UDP特征域名（优先）、红果/字节系域名
+ * - 三套CONNECT模板
+ * - 校验代理返回的HTTP状态码，只接受200
  */
 
+// ===================== 状态常量 =====================
+let HTTP_STATUS_INVALID = -1;
+let HTTP_STATUS_CONNECTED = 0;
+let HTTP_STATUS_WAITRESPONSE = 1;
+let HTTP_STATUS_FORWARDING = 2;
+var httpStatus = HTTP_STATUS_INVALID;
+
+// ===================== 配置 =====================
 const CONFIG = {
-    T5_AUTH_KEY: "683556433",
+    GW_HOST: "153.3.236.22:443",      // 免流网关（Host头）
+    T5_AUTH_KEY: "683556433",         // 固定鉴权（与Lua一致）
     ENABLE_FINGERPRINT_MASK: true,
     MIN_PADDING: 8,
     MAX_PADDING: 48,
-    LOG_DEBUG: false   // 调试时改为true
+    LOG_DEBUG: false                  // 调试时改为true
 };
 
-// 百度UA池
+// ===================== UA池 & 域名关键词 =====================
 const BAIDU_UA_POOL = [
     "baiduboxapp/8.5.0.0 (Linux; Android 12; Mi 13 Pro)",
     "baiduboxapp/9.0.1.0 (Linux; Android 13; SM-S928B)",
@@ -30,28 +42,18 @@ const BAIDU_UA_POOL = [
     "netdisk;11.18.3;android-android;12;Mobile"
 ];
 
-// 红果/字节系域名关键词
 const HK_DOMAINS = [
     "zijie", "hongguo", "novel", "pangolin", "sigmob",
     "amemv", "douyin", "iesdouyin", "byteimg",
     "toutiao", "ixigua", "snssdk", "bdurl", "pstatp"
 ];
 
-// UDP特征关键词（UDP优先）
 const UDP_MASK_DOMAINS = [
     "udp", "quic", "game", "minecraft", "dota", "lol",
     "valorant", "genshin", "bilibili", "qpic", "video", "cdn", "streaming", "live"
 ];
 
-// 会话状态
-const sessionMap = {};
-const STATUS = {
-    INIT: 0,
-    HEADER_SENT: 1,
-    ESTABLISHED: 2
-};
-
-// ===================== 工具函数 =====================
+// ===================== 工具函数（完全对应Lua） =====================
 function log(msg) {
     if (CONFIG.LOG_DEBUG) console.log(`[BD-MASK] ${msg}`);
 }
@@ -91,26 +93,16 @@ function matchUdpKeyword(host) {
     return UDP_MASK_DOMAINS.some(k => h.includes(k));
 }
 
-function getSessionState(uuid) {
-    if (!sessionMap[uuid]) {
-        sessionMap[uuid] = {
-            status: STATUS.INIT,
-            lastHeartbeat: 0
-        };
-    }
-    return sessionMap[uuid];
-}
-
-// ===================== CONNECT报文构造 =====================
-function buildHeader(targetHost, targetPort, gwHost) {
+// ===================== CONNECT报文构造（UDP优先） =====================
+function buildHeader(targetHost, targetPort) {
     const traceId = generateTraceId();
     const ua = getRandomUA();
     const padding = getRandomPadding();
     const isUdp = matchUdpKeyword(targetHost);
     const isHg = isHongguoHost(targetHost);
+    const gwHost = CONFIG.GW_HOST;
 
     let template;
-    // UDP 优先
     if (isUdp) {
         template = `CONNECT ${targetHost}:${targetPort} HTTP/1.1
 Host: ${gwHost}
@@ -159,72 +151,59 @@ ${padding}
     return template.replace(/\n/g, "\r\n");
 }
 
-// ===================== Loon 生命周期回调 =====================
+// ===================== Loon 生命周期回调（星璃原版结构） =====================
 function tunnelDidConnected() {
-    const sess = getSessionState($session.uuid);
-    const gwHost = `${$session.proxy.host}:${$session.proxy.port}`;
-    const targetHost = $session.conHost;
-    const targetPort = $session.conPort;
-
+    console.log($session);
     if (!$session.proxy.isTLS) {
-        const header = buildHeader(targetHost, targetPort, gwHost);
-        $tunnel.write($session, header);
-        sess.status = STATUS.HEADER_SENT;
-        $tunnel.readTo($session, "\r\n\r\n");
-        log(`CONNECT sent (non-TLS) -> ${targetHost}:${targetPort}`);
+        _writeHttpHeader();
+        httpStatus = HTTP_STATUS_CONNECTED;
     }
     return true;
 }
 
 function tunnelTLSFinished() {
-    // 由于配置中未启用tls，该回调不会触发，保留以防万一
-    const sess = getSessionState($session.uuid);
-    const gwHost = `${$session.proxy.host}:${$session.proxy.port}`;
-    const targetHost = $session.conHost;
-    const targetPort = $session.conPort;
-
-    const header = buildHeader(targetHost, targetPort, gwHost);
-    $tunnel.write($session, header);
-    sess.status = STATUS.HEADER_SENT;
-    $tunnel.readTo($session, "\r\n\r\n");
-    log(`CONNECT sent (TLS fallback) -> ${targetHost}:${targetPort}`);
+    // 如果误加了 tls=true，也能工作
+    _writeHttpHeader();
+    httpStatus = HTTP_STATUS_CONNECTED;
     return true;
 }
 
 function tunnelDidRead(data) {
-    const sess = getSessionState($session.uuid);
-    if (sess.status === STATUS.HEADER_SENT) {
-        // 解析HTTP状态码
+    if (httpStatus == HTTP_STATUS_WAITRESPONSE) {
+        // 校验HTTP状态码
         const match = data.match(/HTTP\/\d\.\d\s+(\d+)/);
-        if (match) {
-            const code = parseInt(match[1], 10);
-            if (code !== 200) {
-                log(`Proxy returned HTTP ${code}, closing tunnel`);
-                $tunnel.close($session);
-                return null;
-            }
+        if (match && parseInt(match[1], 10) === 200) {
+            console.log('HTTP handshake success (200)');
+            httpStatus = HTTP_STATUS_FORWARDING;
+            $tunnel.established($session);
+            return null; // 丢弃响应头
         } else {
-            // 无法解析状态码，视为异常
-            log("Invalid proxy response, closing");
+            console.log('Proxy returned non-200, closing tunnel');
             $tunnel.close($session);
             return null;
         }
-        // 状态200，握手成功
-        sess.status = STATUS.ESTABLISHED;
-        $tunnel.established($session);
-        log("Tunnel established (HTTP 200)");
-        return null;   // 丢弃响应头
+    } else if (httpStatus == HTTP_STATUS_FORWARDING) {
+        return data;
     }
     return data;
 }
 
 function tunnelDidWrite() {
-    // 不做任何主动写入
+    if (httpStatus == HTTP_STATUS_CONNECTED) {
+        console.log('CONNECT header sent, waiting for response');
+        httpStatus = HTTP_STATUS_WAITRESPONSE;
+        $tunnel.readTo($session, '\x0D\x0A\x0D\x0A');
+        return false; // 暂停后续写回调
+    }
     return true;
 }
 
 function tunnelDidClose() {
-    delete sessionMap[$session.uuid];
-    log(`Session closed: ${$session.uuid}`);
     return true;
+}
+
+// ===================== 发送CONNECT头 =====================
+function _writeHttpHeader() {
+    const header = buildHeader($session.conHost, $session.conPort);
+    $tunnel.write($session, header);
 }
