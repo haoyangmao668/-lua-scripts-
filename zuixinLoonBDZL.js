@@ -1,18 +1,15 @@
 /**
- * Loon Custom协议 | 百度免流直连（UDP优先版）
- * 适配：Loon custom type
+ * Loon Custom协议 | 百度免流直连（UDP优先 + 状态校验）
+ * 适配：Loon custom type，使用明文HTTP代理（配置中不要加 tls=true）
  * 使用示例：
  * [Proxy]
- * BaiduFree = custom, 153.3.236.22, 443, tls=true, script-path=脚本地址
+ * BaiduFree = custom, 153.3.236.22, 443, script-path=脚本地址
  * 
  * 特性：
  * - 动态UA、40位随机TraceID、TLS Padding抗指纹
- * - 智能识别UDP特征域名（优先）、红果/字节系域名
- * - 三套CONNECT模板自动切换
+ * - UDP特征域名优先，其次红果/字节系
+ * - 校验代理返回的HTTP状态码，非200时自动断开
  * - 基于readTo()可靠握手
- * - 无心跳（TCP连接由系统保活）
- * 
- * 注意：Loon无法识别真实UDP，仅根据域名关键词模拟UDP伪装。
  */
 
 const CONFIG = {
@@ -20,7 +17,7 @@ const CONFIG = {
     ENABLE_FINGERPRINT_MASK: true,
     MIN_PADDING: 8,
     MAX_PADDING: 48,
-    LOG_DEBUG: false   // 生产环境建议关闭
+    LOG_DEBUG: false   // 调试时改为true
 };
 
 // 百度UA池
@@ -89,7 +86,7 @@ function isHongguoHost(host) {
 }
 
 function matchUdpKeyword(host) {
-    if (!host) return false;   // 若无域名，不启用UDP模板
+    if (!host) return false;
     const h = host.toLowerCase();
     return UDP_MASK_DOMAINS.some(k => h.includes(k));
 }
@@ -131,7 +128,7 @@ X-TLS-Version: TLSv1.3
 ${padding}Accept: */*
 Content-Length: 0
 
-`;   // 末尾有两个换行
+`;
     } else if (isHg) {
         template = `CONNECT ${targetHost}:${targetPort} HTTP/1.1
 Host: ${gwHost}
@@ -145,9 +142,8 @@ X-Bd-Uid: 0
 X-TLS-Version: TLSv1.3
 ${padding}Accept: */*
 
-`;   // 末尾有两个换行
+`;
     } else {
-        // 默认模板
         template = `CONNECT ${targetHost}:${targetPort} HTTP/1.1
 Host: ${gwHost}
 Proxy-Connection: Keep-Alive
@@ -158,9 +154,8 @@ X-Bd-Traceid: ${traceId}
 X-TLS-Version: TLSv1.3
 ${padding}
 
-`;   // 末尾有两个换行（注意${padding}后面跟一个换行，然后空行）
+`;
     }
-    // 统一将 \n 替换为 \r\n
     return template.replace(/\n/g, "\r\n");
 }
 
@@ -175,7 +170,6 @@ function tunnelDidConnected() {
         const header = buildHeader(targetHost, targetPort, gwHost);
         $tunnel.write($session, header);
         sess.status = STATUS.HEADER_SENT;
-        // 等待网关返回 HTTP 200 响应头
         $tunnel.readTo($session, "\r\n\r\n");
         log(`CONNECT sent (non-TLS) -> ${targetHost}:${targetPort}`);
     }
@@ -183,6 +177,7 @@ function tunnelDidConnected() {
 }
 
 function tunnelTLSFinished() {
+    // 由于配置中未启用tls，该回调不会触发，保留以防万一
     const sess = getSessionState($session.uuid);
     const gwHost = `${$session.proxy.host}:${$session.proxy.port}`;
     const targetHost = $session.conHost;
@@ -192,25 +187,39 @@ function tunnelTLSFinished() {
     $tunnel.write($session, header);
     sess.status = STATUS.HEADER_SENT;
     $tunnel.readTo($session, "\r\n\r\n");
-    log(`CONNECT sent (TLS) -> ${targetHost}:${targetPort}`);
+    log(`CONNECT sent (TLS fallback) -> ${targetHost}:${targetPort}`);
     return true;
 }
 
 function tunnelDidRead(data) {
     const sess = getSessionState($session.uuid);
     if (sess.status === STATUS.HEADER_SENT) {
-        // 接收到完整的响应头，握手成功
+        // 解析HTTP状态码
+        const match = data.match(/HTTP\/\d\.\d\s+(\d+)/);
+        if (match) {
+            const code = parseInt(match[1], 10);
+            if (code !== 200) {
+                log(`Proxy returned HTTP ${code}, closing tunnel`);
+                $tunnel.close($session);
+                return null;
+            }
+        } else {
+            // 无法解析状态码，视为异常
+            log("Invalid proxy response, closing");
+            $tunnel.close($session);
+            return null;
+        }
+        // 状态200，握手成功
         sess.status = STATUS.ESTABLISHED;
         $tunnel.established($session);
-        log("Tunnel established, proxy responded 200");
-        return null;   // 丢弃代理的响应头
+        log("Tunnel established (HTTP 200)");
+        return null;   // 丢弃响应头
     }
-    // 正常透传数据
     return data;
 }
 
 function tunnelDidWrite() {
-    // 不再进行任何主动写入（心跳等），防止递归
+    // 不做任何主动写入
     return true;
 }
 
